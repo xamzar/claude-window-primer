@@ -1,0 +1,6 @@
+.env
+config.json
+state.json
+primer.log
+__pycache__/
+*.pyc
