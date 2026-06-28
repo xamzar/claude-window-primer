@@ -1,0 +1,17 @@
+[Unit]
+Description=Claude Pro 5-hour window primer
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/playground/claude-window-primer
+ExecStart=%h/playground/claude-window-primer/primer.py bot
+Restart=on-failure
+RestartSec=30
+Environment=PYTHONUNBUFFERED=1
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target
