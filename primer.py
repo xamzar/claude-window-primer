@@ -539,12 +539,30 @@ def handle_command(cfg: dict, text: str, chat_id) -> None:
     reply("Unknown command. /help for the list.")
 
 
+def run_scheduler_only() -> None:
+    """Prime on schedule with no Telegram (no token configured).
+
+    The core job — keeping the window ticking — doesn't need Telegram; that's
+    only notifications and remote control. So instead of exiting (which would
+    restart-loop under systemd), run the bare scheduler and let the user add a
+    token later.
+    """
+    while True:
+        try:
+            tick_once(load_config(), load_state())
+        except Exception as e:  # noqa: BLE001
+            log(f"tick error: {e}")
+        time.sleep(30)
+
+
 def cmd_bot(args) -> None:
     cfg = load_config()
     token = cfg.get("telegram_token", "")
     if not token:
-        print("ERROR: telegram_token is not set (use .env)", file=sys.stderr)
-        sys.exit(1)
+        log("bot: no telegram_token - running in SCHEDULE-ONLY mode "
+            "(set TELEGRAM_TOKEN in .env and restart for notifications/control)")
+        run_scheduler_only()
+        return
 
     log("bot: started")
     register_commands(cfg)
