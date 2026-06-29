@@ -4,3 +4,4 @@ state.json
 primer.log
 __pycache__/
 *.pyc
+.test-scratch/

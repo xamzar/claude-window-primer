@@ -1,8 +1,9 @@
 name: claude-window-primer
-stage: playground
+stage: testing
 kind: personal
 purpose: Track and prime Claude Pro 5-hour rate-limit reset windows to maximize subscription token usage.
 owner: xmzr
 created: 2026-06-28
 history:
   - { stage: playground, date: 2026-06-28 }
+  - { stage: testing, date: 2026-06-29 }

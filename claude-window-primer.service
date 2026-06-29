@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=%h/playground/claude-window-primer
-ExecStart=%h/playground/claude-window-primer/primer.py bot
+WorkingDirectory=%h/testing/claude-window-primer
+ExecStart=%h/testing/claude-window-primer/primer.py bot
 Restart=on-failure
 RestartSec=30
 Environment=PYTHONUNBUFFERED=1

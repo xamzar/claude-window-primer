@@ -35,6 +35,7 @@ No third-party dependencies (urllib + stdlib only).
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import time
@@ -57,6 +58,8 @@ DEFAULT_CONFIG = {
     "model": "claude-haiku-4-5-20251001",
     "cycle_minutes": 300,          # 5-hour window
     "margin_minutes": 3,           # prime this many minutes AFTER the reset
+    "retry_minutes": 10,           # after a transient failure, retry this soon
+                                   # (not a full cycle later)
     "prompt": "Reply with exactly one word: pong",
     "claude_timeout_secs": 120,
     "notify_on_prime": True,
@@ -229,7 +232,52 @@ def status_text(cfg: dict, state: dict) -> str:
 # --------------------------------------------------------------------------- #
 # the actual prime
 # --------------------------------------------------------------------------- #
+# Matches the human reset hint Claude returns inside a 429 result, e.g.
+#   "You've hit your session limit · resets 9:20pm (UTC)"
+#   "...resets 3am"   "...resets 11:30 (Asia/Taipei)"
+RESET_RE = re.compile(
+    r"resets?\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*(?:\(([^)]+)\))?",
+    re.IGNORECASE,
+)
+
+
+def parse_reset_time(text: str, cfg: dict):
+    """Pull the real reset wall-clock time out of a session-limit message and
+    return the epoch of its next future occurrence, or None if not parseable.
+
+    The window has NOT reset yet when we see this, so Claude is handing us the
+    authoritative anchor — we trust it over any cycle-length guess.
+    """
+    m = RESET_RE.search(text or "")
+    if not m:
+        return None
+    hh = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    ampm = (m.group(3) or "").lower()
+    tzname = (m.group(4) or "").strip()
+    if ampm == "pm" and hh != 12:
+        hh += 12
+    elif ampm == "am" and hh == 12:
+        hh = 0
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    # Interpret the clock in the timezone the message named, falling back to the
+    # configured tz when absent or unrecognized.
+    tz_i = tzinfo(cfg)
+    if tzname:
+        try:
+            tz_i = ZoneInfo(tzname)
+        except (ZoneInfoNotFoundError, ValueError):
+            tz_i = tzinfo(cfg)
+    now = datetime.now(tz_i)
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    while target <= now:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
 def run_prime(cfg: dict):
+    """Return (ok, detail, info). info may carry {'limit_hit', 'reset_epoch'}."""
     cmd = ["claude", "-p", cfg["prompt"], "--model", cfg["model"],
            "--output-format", "json"]
     start = time.time()
@@ -237,30 +285,62 @@ def run_prime(cfg: dict):
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=cfg.get("claude_timeout_secs", 120))
     except subprocess.TimeoutExpired:
-        return False, "claude timed out"
+        return False, "claude timed out", {}
     except FileNotFoundError:
-        return False, "claude CLI not found in PATH"
+        return False, "claude CLI not found in PATH", {}
     dur = time.time() - start
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:300]
-        return False, f"exit={proc.returncode}: {err}"
+
+    # Claude emits a result JSON on stdout even on rate-limit errors, so parse it
+    # before trusting the exit code.
     try:
         out = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        out = None
+
+    if isinstance(out, dict) and out.get("is_error"):
+        result = str(out.get("result", "")).strip()
+        info = {}
+        if out.get("api_error_status") == 429 or "limit" in result.lower():
+            info["limit_hit"] = True
+            reset_epoch = parse_reset_time(result, cfg)
+            if reset_epoch:
+                info["reset_epoch"] = reset_epoch
+        return False, f"limit/error: {result[:120]}", info
+
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip().replace("\n", " ")[:300]
+        return False, f"exit={proc.returncode}: {err}", {}
+
+    if isinstance(out, dict):
         reply = str(out.get("result", "")).strip()[:60]
-        return True, f"reply='{reply}' ({dur:.1f}s)"
-    except json.JSONDecodeError:
-        return True, f"ok ({dur:.1f}s)"
+        return True, f"reply='{reply}' ({dur:.1f}s)", {}
+    return True, f"ok ({dur:.1f}s)", {}
 
 
 def do_prime(cfg: dict, state: dict, *, reason: str) -> None:
     now = time.time()
     cycle = cfg["cycle_minutes"] * 60
     margin = cfg["margin_minutes"] * 60
+    retry = cfg.get("retry_minutes", 10) * 60
 
-    ok, detail = run_prime(cfg)
+    ok, detail, info = run_prime(cfg)
+    limit_reset = info.get("reset_epoch")
 
-    next_reset = now + cycle
-    next_prime = next_reset + margin
+    if ok:
+        # Fresh window started here; chain the next prime one cycle out.
+        next_reset = now + cycle
+        next_prime = next_reset + margin
+    elif limit_reset:
+        # We primed before the window actually reset. Claude told us the real
+        # reset time — anchor to it instead of guessing now+cycle.
+        next_reset = limit_reset
+        next_prime = next_reset + margin
+    else:
+        # Transient failure (network/timeout/unparsed limit): retry soon rather
+        # than sitting idle for a whole cycle.
+        next_reset = now + cycle
+        next_prime = now + retry
+
     state.update({
         "last_prime_epoch": now,
         "last_prime_ok": ok,
@@ -280,6 +360,15 @@ def do_prime(cfg: dict, state: dict, *, reason: str) -> None:
                     f"⏳ Resets: <b>{fmt(next_reset, cfg)}</b>\n"
                     f"🤖 Next prime: {fmt(next_prime, cfg)}\n"
                     "🔗 Chain anchored here (the only active schedule)")
+    elif limit_reset:
+        log(f"PRIME LIMIT ({reason}): {detail}; re-anchored to {fmt(limit_reset, cfg)}")
+        if cfg.get("notify_on_failure"):
+            tg_send(cfg,
+                    "⏳ <b>Window not reset yet</b>\n"
+                    f"🕐 Now: {fmt(now, cfg)}\n"
+                    "🔒 Already at the session limit — nothing to prime.\n"
+                    f"📍 Real reset: <b>{fmt(next_reset, cfg)}</b> (per Claude)\n"
+                    f"🤖 Re-anchored prime: {fmt(next_prime, cfg)}")
     else:
         log(f"PRIME FAIL ({reason}): {detail}")
         if cfg.get("notify_on_failure"):

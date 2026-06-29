@@ -2,7 +2,7 @@
 name: claude-window-primer
 aliases: [claude-window-primer]
 tags: [project]
-stage: playground
+stage: testing
 ---
 
 # claude-window-primer
@@ -15,7 +15,8 @@ A lightweight Python service that sends a minimal `claude -p` request every 5 ho
 Based on the open-source [[claude-limit-primer]].
 
 ## Status
-Playground — initial fork. Testing on core VM.
+Playground — working on the core VM. Self-correcting schedule (parses the real
+reset time out of a 429), offline unit tests pass, ready to promote to testing.
 
 ## Related
 - [[claude-limit-primer]] — upstream reference

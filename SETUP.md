@@ -14,7 +14,7 @@
 ### 2. Configure
 
 ```bash
-cd ~/playground/claude-window-primer
+cd ~/testing/claude-window-primer
 
 # Secrets (never committed)
 echo 'TELEGRAM_TOKEN=your_bot_token_here' > .env
@@ -93,16 +93,16 @@ systemctl --user status claude-window-primer
 journalctl --user -u claude-window-primer -f
 
 # Check the local log file
-tail -f ~/playground/claude-window-primer/primer.log
+tail -f ~/testing/claude-window-primer/primer.log
 
 # Test claude CLI works
 claude -p "test" --model claude-haiku-4-5-20251001 --output-format json
 
 # Dry-run a manual prime
-cd ~/playground/claude-window-primer && python3 primer.py prime
+cd ~/testing/claude-window-primer && python3 primer.py prime
 
 # Check state file
-cat ~/playground/claude-window-primer/state.json
+cat ~/testing/claude-window-primer/state.json
 
 # Force re-auth if expired
 claude login
@@ -118,6 +118,7 @@ claude login
 | `model` | `claude-haiku-4-5-20251001` | Cheapest model for the ping |
 | `cycle_minutes` | `300` | Window length (5 hours) |
 | `margin_minutes` | `3` | Minutes after reset to prime |
+| `retry_minutes` | `10` | After a transient prime failure (network/timeout), retry this soon instead of waiting a full cycle |
 | `prompt` | `Reply with exactly one word: pong` | The throwaway prompt |
 | `claude_timeout_secs` | `120` | Max seconds for claude CLI call |
 | `notify_on_prime` | `true` | Telegram notification on each prime |
@@ -125,6 +126,21 @@ claude login
 
 Secrets (`TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`) live only in `.env` (gitignored)
 and are never written back to `config.json`.
+
+## If you prime too early
+
+If a prime lands *before* the window has actually reset, Claude returns a 429
+whose message names the real reset time (e.g. `resets 9:20pm (UTC)`). The primer
+parses that, re-anchors the next prime to `reset + margin`, and tells you on
+Telegram — so the chain self-corrects instead of drifting.
+
+## Tests
+
+Offline unit tests (no network, no `claude` CLI needed):
+
+```bash
+cd ~/testing/claude-window-primer && python3 -m unittest test_primer
+```
 
 ## Cost
 
