@@ -199,6 +199,7 @@ def set_anchor(cfg: dict, reset_str: str, tz: str | None = None) -> dict:
         "next_prime_epoch": first_prime.timestamp(),
         "paused": False,
     })
+    state.pop("retry_stage", None)
     state.setdefault("last_prime_epoch", None)
     save_state(state)
     return state
@@ -226,6 +227,11 @@ def status_text(cfg: dict, state: dict) -> str:
     lines.append(f"🤖 Next prime: {fmt(np, cfg)} (in {(np-now)/3600:.1f} h)")
     if paused:
         lines.append("⏸ <b>Paused</b> - auto-prime is off (/resume to enable)")
+    rs = state.get("retry_stage")
+    if rs is not None:
+        tags = ["+30s", "+60s", f"+{cfg['margin_minutes']}min"]
+        tag = tags[min(rs, len(tags)-1)]
+        lines.append(f"🔁 Retry stage {rs+1}/3 ({tag}) — escalating margin after limit")
     return "\n".join(lines)
 
 
@@ -243,10 +249,13 @@ RESET_RE = re.compile(
 
 def parse_reset_time(text: str, cfg: dict):
     """Pull the real reset wall-clock time out of a session-limit message and
-    return the epoch of its next future occurrence, or None if not parseable.
+    return the epoch of the occurrence *nearest* to now, or None if unparseable.
 
-    The window has NOT reset yet when we see this, so Claude is handing us the
-    authoritative anchor — we trust it over any cycle-length guess.
+    A 429 reset is always close to now — at most ~one cycle ahead, and possibly a
+    few seconds in the past when we retry within the reported minute (Claude only
+    reports minute precision). Picking the next *future* occurrence would roll a
+    just-passed reset a full day forward, skipping a whole window; pick the
+    nearest occurrence instead.
     """
     m = RESET_RE.search(text or "")
     if not m:
@@ -270,9 +279,11 @@ def parse_reset_time(text: str, cfg: dict):
         except (ZoneInfoNotFoundError, ValueError):
             tz_i = tzinfo(cfg)
     now = datetime.now(tz_i)
-    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    while target <= now:
-        target += timedelta(days=1)
+    base = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    # Nearest of yesterday/today/tomorrow at this clock time (ties -> the later
+    # one, so an exactly-equidistant reset is treated as upcoming, not past).
+    target = min((base + timedelta(days=d) for d in (-1, 0, 1)),
+                 key=lambda t: (abs(t - now), t < now))
     return target.timestamp()
 
 
@@ -322,24 +333,37 @@ def do_prime(cfg: dict, state: dict, *, reason: str) -> None:
     cycle = cfg["cycle_minutes"] * 60
     margin = cfg["margin_minutes"] * 60
     retry = cfg.get("retry_minutes", 10) * 60
+    # Cascading retry margins after a parsed reset: 30s, 60s, then the config
+    # margin (default 3 min).  Advances one stage per failed 429 on the same reset.
+    RETRY_MARGINS = [30, 60, margin]
 
     ok, detail, info = run_prime(cfg)
     limit_reset = info.get("reset_epoch")
 
     if ok:
-        # Fresh window started here; chain the next prime one cycle out.
         next_reset = now + cycle
         next_prime = next_reset + margin
+        state.pop("retry_stage", None)
     elif limit_reset:
-        # We primed before the window actually reset. Claude told us the real
-        # reset time — anchor to it instead of guessing now+cycle.
+        prev_reset = state.get("next_reset_epoch")
+        retry_stage = state.get("retry_stage", 0)
+        # Same reset time we were already aiming at?  Advance to the next margin
+        # so we retry faster: 30s → 60s → config margin.
+        if prev_reset and abs(limit_reset - prev_reset) < 5:
+            retry_stage = min(retry_stage + 1, len(RETRY_MARGINS) - 1)
+        else:
+            retry_stage = 0   # new reset time — start at the fastest margin
         next_reset = limit_reset
-        next_prime = next_reset + margin
+        next_prime = next_reset + RETRY_MARGINS[retry_stage]
+        # Never schedule in the past — if the parsed reset is already behind us,
+        # fall back to retrying after the config margin from now.
+        if next_prime <= now:
+            next_prime = now + margin
+        state["retry_stage"] = retry_stage
     else:
-        # Transient failure (network/timeout/unparsed limit): retry soon rather
-        # than sitting idle for a whole cycle.
         next_reset = now + cycle
         next_prime = now + retry
+        state.pop("retry_stage", None)
 
     state.update({
         "last_prime_epoch": now,
@@ -361,14 +385,16 @@ def do_prime(cfg: dict, state: dict, *, reason: str) -> None:
                     f"🤖 Next prime: {fmt(next_prime, cfg)}\n"
                     "🔗 Chain anchored here (the only active schedule)")
     elif limit_reset:
-        log(f"PRIME LIMIT ({reason}): {detail}; re-anchored to {fmt(limit_reset, cfg)}")
+        stage = state.get("retry_stage", 0)
+        tag = ["+30s", "+60s", f"+{margin//60}min"][stage] if stage < 3 else f"+{margin//60}min"
+        log(f"PRIME LIMIT ({reason}): {detail}; reset={fmt(limit_reset, cfg)} prime={tag}")
         if cfg.get("notify_on_failure"):
             tg_send(cfg,
                     "⏳ <b>Window not reset yet</b>\n"
                     f"🕐 Now: {fmt(now, cfg)}\n"
                     "🔒 Already at the session limit — nothing to prime.\n"
                     f"📍 Real reset: <b>{fmt(next_reset, cfg)}</b> (per Claude)\n"
-                    f"🤖 Re-anchored prime: {fmt(next_prime, cfg)}")
+                    f"🤖 Next try: {fmt(next_prime, cfg)} ({tag})")
     else:
         log(f"PRIME FAIL ({reason}): {detail}")
         if cfg.get("notify_on_failure"):

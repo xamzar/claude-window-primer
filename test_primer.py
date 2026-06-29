@@ -9,7 +9,7 @@ import importlib.util
 import json
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,6 +25,19 @@ UTC = ZoneInfo("UTC")
 
 def _utc(epoch):
     return datetime.fromtimestamp(epoch, UTC)
+
+
+def _reset_epoch(hhmm: str, tzname: str = "UTC"):
+    """Nearest occurrence of HH:MM to now — mirrors parse_reset_time so the
+    state we hand do_prime lines up with what the parser computes (otherwise the
+    'same reset?' check would spuriously differ depending on time of day)."""
+    hh, mm = map(int, hhmm.split(":"))
+    z = ZoneInfo(tzname)
+    now = datetime.now(z)
+    base = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    target = min((base + timedelta(days=d) for d in (-1, 0, 1)),
+                 key=lambda t: (abs(t - now), t < now))
+    return target.timestamp()
 
 
 class ParseResetTime(unittest.TestCase):
@@ -51,9 +64,22 @@ class ParseResetTime(unittest.TestCase):
         self.assertIsNone(primer.parse_reset_time("no hint here", self.cfg))
         self.assertIsNone(primer.parse_reset_time("", self.cfg))
 
-    def test_always_in_the_future(self):
-        ep = primer.parse_reset_time("resets 3am", self.cfg)
-        self.assertGreater(ep, time.time())
+    def test_future_reset_resolves_forward(self):
+        # A reset ~2h ahead resolves to that upcoming time, not yesterday.
+        soon = datetime.now(UTC) + timedelta(hours=2)
+        ep = primer.parse_reset_time(
+            f"resets {soon.strftime('%H:%M')} (UTC)", self.cfg)
+        self.assertAlmostEqual(ep, soon.timestamp(), delta=90)
+
+    def test_just_passed_reset_does_not_roll_a_day(self):
+        # Regression: retrying within the reported minute (reset seconds in the
+        # past) must stay on today, not jump ~24h forward. This is the bug that
+        # silently broke the escalating-retry feature.
+        now = datetime.now(UTC)
+        ep = primer.parse_reset_time(
+            f"resets {now.strftime('%H:%M')} (UTC)", self.cfg)
+        self.assertLess(abs(ep - now.timestamp()), 120,
+                        "reset in the current minute rolled forward a full day")
 
 
 class _StubProc:
@@ -101,7 +127,59 @@ class DoPrimeBranches(unittest.TestCase):
         nr = _utc(state["next_reset_epoch"])
         np = _utc(state["next_prime_epoch"])
         self.assertEqual((nr.hour, nr.minute), (21, 20))   # the reported reset
-        self.assertEqual((np.hour, np.minute), (21, 23))   # reset + margin
+        # Stage 0 = +30s → minutes still 20 (21:20:30)
+        self.assertEqual((np.hour, np.minute), (21, 20))
+        self.assertAlmostEqual(np.second, 30, delta=1)
+        self.assertEqual(state.get("retry_stage"), 0)
+
+    def test_limit_escalates_retry_margin(self):
+        """Same reset time, second hit → advance to +60s; third → +180s."""
+        msg = json.dumps({
+            "is_error": True, "api_error_status": 429,
+            "result": "You've hit your session limit · resets 9:20pm (UTC)"})
+        self._stub(_StubProc(1, msg))
+        state = {"next_reset_epoch": _reset_epoch("21:20", "UTC")}
+        primer.do_prime(self.cfg, state, reason="t")
+        np = _utc(state["next_prime_epoch"])
+        # retry_stage was 0, same reset → advance to 1 = +60s
+        self.assertEqual(state["retry_stage"], 1)
+        self.assertEqual((np.hour, np.minute), (21, 21))   # 21:21:00
+
+        # Third hit on same reset → stage 2 = config margin (180s)
+        self._stub(_StubProc(1, msg))
+        state["retry_stage"] = 1   # simulate previous state
+        state["next_reset_epoch"] = _reset_epoch("21:20", "UTC")
+        primer.do_prime(self.cfg, state, reason="t")
+        np = _utc(state["next_prime_epoch"])
+        self.assertEqual(state["retry_stage"], 2)
+        self.assertEqual((np.hour, np.minute), (21, 23))   # 21:23 = +3min
+
+    def test_limit_new_reset_resets_stage(self):
+        """Different reset time → retry_stage goes back to 0."""
+        self._stub(_StubProc(1, json.dumps({
+            "is_error": True, "api_error_status": 429,
+            "result": "You've hit your session limit · resets 10:00am (UTC)"})))
+        state = {"retry_stage": 2, "next_reset_epoch": _reset_epoch("21:20", "UTC")}
+        primer.do_prime(self.cfg, state, reason="t")
+        self.assertEqual(state["retry_stage"], 0)   # new reset, stage reset
+
+    def test_escalation_works_when_retrying_within_reported_minute(self):
+        """End-to-end regression: when the retry fires within the reported reset
+        minute (reset now seconds in the past), the parser must keep it on today
+        so the stage escalates instead of jumping ~24h and resetting to 0."""
+        now = datetime.now(UTC)
+        msg = json.dumps({
+            "is_error": True, "api_error_status": 429,
+            "result": f"You've hit your session limit · resets "
+                      f"{now.strftime('%H:%M')} (UTC)"})
+        self._stub(_StubProc(1, msg))
+        # We already hit this reset once (stage 0) and are retrying now.
+        state = {"next_reset_epoch": _reset_epoch(now.strftime('%H:%M'), "UTC"),
+                 "retry_stage": 0}
+        primer.do_prime(self.cfg, state, reason="t")
+        self.assertEqual(state["retry_stage"], 1, "stage failed to escalate")
+        hours_out = (state["next_prime_epoch"] - now.timestamp()) / 3600
+        self.assertLess(hours_out, 1, "next prime jumped ~a day instead of escalating")
 
     def test_transient_failure_retries_soon(self):
         self._stub(_StubProc(1, "boom", "network down"))
